@@ -1,0 +1,277 @@
+<<load-packages>>=
+library(package = "pheatmap")
+library(package = "EDASeq")
+library(package = "tidyverse")
+@
+
+<<session-options>>=
+options(stringsAsFactors = FALSE)
+workDir <- "/Users/sxf279/Desktop/Projects/20171124_VB012/Workspace"
+@ 
+
+<<load-gsea-vax>>=
+load(file = file.path(workDir, "data/guroff.gseaOutput.vaxdb.RData"))
+@
+
+<<heat-sharavin>>=
+load(file = file.path(workDir, "data/esetCombatBaselined.guroff.RData"))
+gsName <- paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                 "RECOVERYMONOCYTE_LPS_VS_NONE_UP")
+# ALV Control
+gseaTemp <- gseaOutput %>%
+  filter(NAME %in% gsName &
+           `FDR q-val` <= 0.05 &
+           modelName %in% "ALVAC.Control.post4th-pre_challenge")
+
+leLS <- strsplit(gseaTemp$LEADING_EDGE, split = ",") %>%
+  unlist()
+
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                      grepl(pattern = "Control.+ALVAC",
+                            esetCombatBaselined$Group) &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+colOrder <- apply(mat, MARGIN = 1, FUN = rank) %>%
+  rowMeans() %>%
+  data.frame(meanrank = .) %>%
+  rownames_to_column()
+
+# ALV
+gseaTemp <- gseaOutput %>%
+  filter(NAME %in% gsName &
+           `FDR q-val` <= 0.05 &
+           modelName %in% "ALVAC.post4th-pre_challenge")
+
+leLS <- strsplit(gseaTemp$LEADING_EDGE, split = ",") %>%
+  unlist()
+
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                            esetCombatBaselined$Group %in% "ALVAC group" &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+apply(mat, MARGIN = 1, FUN = rank) %>%
+  rowMeans() %>%
+  data.frame(meanrank = .) %>%
+  rownames_to_column() %>%
+  rbind(colOrder, .) -> colOrder
+
+# common le
+gseaTemp <- gseaOutput %>%
+  filter(NAME %in% c(paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                            "RECOVERYMONOCYTE_LPS_VS_NONE_UP"),
+                     paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                            "RECOVERYMONOCYTELPS_VS_SEPSISMONOCYTELPS_UP")) &
+           `FDR q-val` <= 0.05 &
+           grepl(pattern = "ALVAC.+post4th", modelName))
+
+leLS <- strsplit(gseaTemp$LEADING_EDGE, split = ",") %>%
+  unlist() %>%
+  data.frame(symbol = .) %>%
+  group_by(symbol) %>%
+  summarize(n = n()) %>%
+  filter(n %in% 4) %>%
+  .$symbol
+
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                      grepl(pattern = "ALVAC",
+                            esetCombatBaselined$Group) &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+colOrder <- colOrder%>%
+  merge(y    = select(pData(esetTemp),
+                      `Sample Identification.CWRU ID`,
+                      Group,
+                      Macaque,
+                      `No. of.challenges`),
+        by.x = "rowname",
+        by.y = "Sample Identification.CWRU ID") %>%
+  mutate(`No. of.challenges` = gsub(pattern     = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  arrange(desc(Group), meanrank)
+colAnnot <- select(pData(esetTemp),
+                   `Sample Identification.CWRU ID`,
+                   Group,
+                   `No. of.challenges`) %>%
+  mutate(Group = gsub(pattern = " challenged.+| group",
+                      replacement = "",
+                      Group),
+         `No. of.challenges` = gsub(pattern     = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  column_to_rownames(var = "Sample Identification.CWRU ID")
+rowOrder <- rowMeans(mat) %>%
+  data.frame(mu = .) %>%
+  rownames_to_column() %>%
+  merge(y    = select(fData(esetTemp),
+                      gene_id,
+                      gene_name),
+        by.x = "rowname",
+        by.y = "gene_id") %>%
+  arrange(desc(mu))
+breakLS <- c(-5, seq(from = -3, to =3, length.out = 99), 7) 
+pheatmap(mat          = mat[rowOrder$rowname, colOrder$rowname],
+         breaks = breakLS,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         gaps_col     = 5,
+         labels_col   = colOrder$Macaque,
+         labels_row   = rowOrder$gene_name,
+         cellwidth    = 6,
+         cellheight   = 6,
+         fontsize     = 6,
+         annotation_col = colAnnot)
+
+colOrder %>%
+  group_by(Group) %>%
+  do(rho = cor.test(formula = ~`No. of.challenges`+meanrank,
+                    data = .,
+                    method = "spearman")$estimate,
+     p = cor.test(formula = ~`No. of.challenges`+meanrank,
+                    data = .,
+                  method = "spearman")$p.value) %>%
+  mutate(rho = unlist(rho),
+         p = unlist(p))
+@ 
+
+<<load-gsea-msig>>=
+load(file = file.path(workDir,
+                      "data/guroff.gseaOutput.msig.RData"))
+gsName <- "HALLMARK_INTERFERON_GAMMA_RESPONSE"
+gseaTemp <- gseaOutput %>%
+  filter(NAME %in% gsName &
+#           `FDR q-val` <= 0.05 &
+           grepl("DNA.post4th", modelName)) #%in% ".Control.post4th-pre_challenge")
+
+leLS <- strsplit(gseaTemp$LEADING_EDGE, split = ",") %>%
+  unlist()
+
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                      grepl(pattern = "Control.+DNA",
+                            esetCombatBaselined$Group) &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+mat <- mat[cor(t(mat), as.numeric(esetTemp$"No. of.challenges")) > 0, ]
+colOrder <- apply(mat, MARGIN = 1, FUN = rank) %>%
+  rowMeans() %>%
+  data.frame(meanrank = .) %>%
+  rownames_to_column()
+
+# ALV
+gsName <- "HALLMARK_INTERFERON_ALPHA_RESPONSE"
+gseaTemp <- gseaOutput %>%
+  filter(NAME %in% gsName &
+#           `FDR q-val` <= 0.05 &
+           grepl("DNA.post4th", modelName)) #%in% ".Control.post4th-pre_challenge")
+
+leLS <- strsplit(gseaTemp$LEADING_EDGE, split = ",") %>%
+  unlist()
+
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                            esetCombatBaselined$Group %in% "DNA group" &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+apply(mat, MARGIN = 1, FUN = rank) %>%
+  rowMeans() %>%
+  data.frame(meanrank = .) %>%
+  rownames_to_column() %>%
+  rbind(colOrder, .) -> colOrder
+
+# common le
+esetTemp <-
+  esetCombatBaselined[fData(esetCombatBaselined)$gene_name %in%
+                                                 leLS,
+                      grepl(pattern = "DNA",
+                            esetCombatBaselined$Group) &
+                        esetCombatBaselined$"Sample Identification.Treatment" %in%
+                        "post 2nd boost"]
+
+mat <- normCounts(esetTemp)
+colOrder <- colOrder%>%
+  merge(y    = select(pData(esetTemp),
+                      `Sample Identification.CWRU ID`,
+                      Group,
+                      Macaque,
+                      `No. of.challenges`),
+        by.x = "rowname",
+        by.y = "Sample Identification.CWRU ID") %>%
+  mutate(`No. of.challenges` = gsub(pattern     = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  arrange(Group, meanrank)
+colAnnot <- select(pData(esetTemp),
+                   `Sample Identification.CWRU ID`,
+                   Group,
+                   `No. of.challenges`) %>%
+  mutate(Group = gsub(pattern = " challenged.+| group",
+                      replacement = "",
+                      Group),
+         `No. of.challenges` = gsub(pattern     = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  column_to_rownames(var = "Sample Identification.CWRU ID")
+rowOrder <- rowMeans(mat) %>%
+  data.frame(mu = .) %>%
+  rownames_to_column() %>%
+  merge(y    = select(fData(esetTemp),
+                      gene_id,
+                      gene_name),
+        by.x = "rowname",
+        by.y = "gene_id") %>%
+  arrange(desc(mu))
+breakLS <- c(-5, seq(from = -1, to =1, length.out = 99), 7) 
+pheatmap(mat          = mat[rowOrder$rowname, colOrder$rowname],
+         breaks = breakLS,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         gaps_col     = 5,
+         labels_col   = colOrder$Macaque,
+         labels_row   = rowOrder$gene_name,
+         cellwidth    = 6,
+         cellheight   = 6,
+         fontsize     = 6,
+         annotation_col = colAnnot)
+
+colOrder %>%
+  group_by(Group) %>%
+  do(rho = cor.test(formula = ~`No. of.challenges`+meanrank,
+                    data = .,
+                    method = "spearman")$estimate,
+     p = cor.test(formula = ~`No. of.challenges`+meanrank,
+                    data = .,
+                  method = "spearman")$p.value) %>%
+  mutate(rho = unlist(rho),
+         p = unlist(p))
+@
+
+<<fig-sg>>=
+filter(gseaOutput,
+       `NOM p-val` <= 0.05 &
+	 NES < 0 &
+	 grepl(pattern = "DNA.+post4th", modelName)) %>%
+  filter(duplicated(NAME) | duplicated(NAME, fromLast = TRUE))
+@ 

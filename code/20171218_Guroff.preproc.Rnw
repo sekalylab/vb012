@@ -1,0 +1,1256 @@
+<<load-packages>>=
+library(package = "parallel")
+library(package = "readr")
+library(package = "readxl")
+library(package = "ggplot2")
+library(package = "survival")
+library(package = "EDASeq")
+library(package = "edgeR")
+library(package = "sva")
+library(package = "pheatmap")
+# library(package = "grid")
+# library(package = "gtable")
+# library(package = "GSEABase")
+# library(package = "igraph")
+library(package = "dplyr")
+library(package = "tidyr")
+library(package = "tibble")
+@ 
+
+<<set-session-options>>=
+options(stringsAsFactors = FALSE,
+        mc.cores         = detectCores() - 1)
+workDir <- "/Users/sxf279/Desktop/Projects/20171124_Guroff/Workspace"
+setwd(dir = workDir)
+@ 
+
+<<read-raw-counts, eval=FALSE>>=
+fileLS <- list.files(path       = "documents",
+                     pattern    = "genecounts",
+                     full.names = TRUE)
+countDF <- lapply(fileLS, FUN = function(fileName) {
+  read_tsv(file = fileName, col_names = FALSE) %>%
+    mutate(SampleID = basename(fileName),
+           SampleID = gsub(pattern     = "_genecounts",
+                           replacement = "\\1",
+                           SampleID))
+}) %>%
+  do.call(what = rbind) %>%
+  spread(SampleID, X2) %>%
+  as.data.frame()
+rownames(countDF) <- countDF$X1
+countDF$X1 <- NULL
+# write genecount matrix
+countDF %>%
+  rownames_to_column() %>%
+  rename(geneid = rowname) %>%
+  write_csv(path = "documents/genecounts.guroff.csv")
+@ 
+
+<<read-genecounts, eval=FALSE>>=
+countDF <- read_csv(file = "documents/genecounts.guroff.csv") %>%
+  column_to_rownames(var = "geneid") %>%
+  as.data.frame()
+@ 
+
+<<read-rnaseq-samplesheet, eval=FALSE>>=
+sampleSheetFile <-
+  file.path(
+      "/Users/sxf279/Desktop/Projects/20171124_Guroff",
+      "Correspondences/20171117_Guroff.emailPW",
+      "F003_Guroff_Mucosal Systemic Study_Sequencing Project Worksheet.xlsx")
+# read header
+cNames <- read_excel(path      = sampleSheetFile,
+                     sheet     = 1,
+                     skip      = 3,
+                     col_names = FALSE) %>%
+  head(n = 3)
+# fill empty cells
+cNames[2, is.na(unlist(cNames[2, ]))] <- cNames[3, is.na(unlist(cNames[2, ]))]
+cNames <- cNames[-3, ]
+# replicate content of merged cells
+for (i in 2:ncol(cNames)) {
+  if (is.na(cNames[1, i]))
+    cNames[1, i] <- cNames[1, i - 1]
+}
+# append first two rows to create colnames
+cNames <- apply(cNames, MARGIN = 2, FUN = paste, collapse = ".")
+# read full sheet
+sampleSheetDF <- read_excel(path      = sampleSheetFile,
+                            sheet     = 1,
+                            skip      = 6,
+                            col_names = FALSE) %>%
+  setNames(nm = cNames)
+# donor 45|O45 should be recoded as 045
+sampleSheetDF <- sampleSheetDF %>%
+  mutate(`Sample Identification.Donor ID` = 
+           ifelse(test = `Sample Identification.Donor ID` %in% c("45", "O45"),
+                  yes  = "045",
+                  no   = `Sample Identification.Donor ID`))
+@
+
+<<read-challenge, eval=FALSE>>=
+challengeFile <- file.path("/Users/sxf279/Desktop/Projects/20171124_Guroff",
+                           "Correspondences/20171128_Guroff.emailMG",
+                           "Copy of Animal information(1).xlsx")
+# read animal treatment group
+Group <- read_excel(path      = challengeFile,
+                    col_names = FALSE) %>%
+  select(X__1)
+# replicate cell content per sub table
+for (i in 2:nrow(Group)) {
+  if (!grepl(pattern = "group", Group[i, 1]))
+    Group[i, 1] <- Group[i - 1, 1]
+}
+# read colnames
+cNames <- read_excel(path      = challengeFile,
+                     col_names = FALSE,
+                     skip      = 1) %>%
+  head(n = 2) %>%
+  mutate(X__4 = ifelse(test = grepl(pattern = "\\)", X__4),
+                       yes  = NA,
+                       no   = X__4)) %>%
+  apply(MARGIN = 2, FUN = paste, collapse = ".") %>%
+  gsub(pattern = "NA.", replacement = "")
+# read full table
+challengeDF <- read_excel(path      = challengeFile,
+                          col_names = FALSE) %>%
+  setNames(nm = cNames) %>%
+  mutate(Group = unlist(Group)) %>%
+  filter(!(grepl(pattern = "group|Macaque", Macaque) | is.na(Macaque)))
+# extract 1st challenge date
+challengeDate <- read_excel(path = challengeFile, col_names = FALSE)
+flag <- grep(pattern = "1st chal", challengeDate$X__4)
+dateLS <- challengeDate$X__4[flag + 1] %>% 
+  gsub(pattern = ")", replacement = "") %>%
+  as.Date(format = "%m/%d/%Y")
+groupLS <- grep(pattern = "group", challengeDate$X__1, value = TRUE)
+challengeDate <- data.frame(Group                  = groupLS,
+                            `Date of 1st challenge` = dateLS,
+                            check.names             = FALSE)
+# covert `Date of birth` to a date
+challengeDF <- challengeDF %>%
+  merge(y = challengeDate, by = "Group") %>%
+  mutate(`Date of birth` = as.numeric(`Date of birth`),
+         `Date of birth` = as.Date(`Date of birth`,
+                                   origin = "1899-12-30"),
+         `Age at 1st challenge` = `Date of 1st challenge` - `Date of birth`,
+         `Age at 1st challenge` = as.numeric(`Age at 1st challenge`)/365.25)
+@
+
+<<print-km-vax-ctrl, echo=FALSE, eval=FALSE>>=
+kmDF <-  challengeDF %>%
+  select(Macaque, Group, `No. of.challenges`) %>%
+  mutate(event = !grepl(pattern = ">15", `No. of.challenges`),
+         event = as.numeric(event),
+         time  = gsub(pattern = ">", replacement = "", `No. of.challenges`),
+         time  = as.numeric(time),
+         group = ifelse(test = grepl(pattern = "Controls", Group),
+                        yes  = "controls",
+                        no   = "vaccinated"))
+fit <- survfit(formula = Surv(time = time, event = event) ~ group, data = kmDF)
+dif <- survdiff(formula = Surv(time = time, event = event) ~ group, data = kmDF)
+
+plotLabel <- paste0("Log-rank test: p=",
+                    signif(pchisq(q          = dif$chisq,
+                                  df         = length(dif$n) - 1,
+                                  lower.tail = FALSE),
+                           digits = 3))
+
+plotDF <- mget(c("time", "surv", "n.censor"), env = as.environment(fit))
+plotDF <- as.data.frame(plotDF)
+plotDF$strata <- rep(names(fit$strata), times = fit$strata)
+plotDF <- rbind(plotDF,
+                data.frame(time     = 0,
+                           surv     = 1,
+                           n.censor = 0,
+                           strata   = names(fit$strata)))
+plotDF <- mutate(plotDF,
+                 strata = gsub(pattern = ".+=(.+)",
+                               replacement = "\\1",
+                               strata),
+                 surv = surv * 100)
+plotKM <- ggplot() +
+  geom_step(data    = plotDF,
+            mapping = aes(x = time, y = surv, color = strata),
+            size    = 1) +
+  geom_point(data    = filter(plotDF, n.censor != 0),
+             mapping = aes(x = time, y = surv),
+             shape   = 4,
+             size    = 3,
+             color   = "purple") +
+  scale_color_manual(name = "", values = c("black", "purple")) +
+  scale_x_continuous(expand = c(0, 0),
+                     limits = c(0, 16),
+                     breaks = seq(from = 0, to = 15, by = 1)) +
+  scale_y_continuous(expand = c(0, 0),
+                     breaks = seq(from = 0, to = 100, by = 10)) +
+  labs(x     = "# of challenges",
+       y     = "Percent uninfected",
+       title = "Combined vaccinated vs concurrent controls") +
+  annotate(geom  = "text",
+           x     = 10,
+           y     = 75,
+           label = plotLabel,
+           size  = 3.5,
+           hjust = 0) +
+  theme_bw() +
+  theme(legend.position      = c(0.7, 0.9),
+        legend.justification = c(0.25, 0.5),
+        axis.line            = element_line(color = "black"),
+        panel.grid           = element_blank(),
+        panel.border         = element_blank(),
+        plot.title           = element_text(hjust = 0.5),
+        legend.key           = element_blank())
+print(plotKM)
+@
+
+<<print-km-dna-ctrl, echo=FALSE, eval=FALSE>>=
+kmDF <-  challengeDF %>%
+  mutate(VaccineGroup = gsub(pattern = ".*(ALVAC|DNA).+",
+                             replacement = "\\1",
+                             Group)) %>%
+  select(Macaque, Group, `No. of.challenges`, VaccineGroup) %>%
+  mutate(event = !grepl(pattern = ">15", `No. of.challenges`),
+         event = as.numeric(event),
+         time  = gsub(pattern = ">", replacement = "", `No. of.challenges`),
+         time  = as.numeric(time),
+         group = ifelse(test = grepl(pattern = "Controls", Group),
+                        yes  = "controls",
+                        no   = "vaccinated"))
+fit <- survfit(formula = Surv(time = time, event = event) ~ group,
+               data    = kmDF,
+               subset  = VaccineGroup %in% "DNA")
+dif <- survdiff(formula = Surv(time = time, event = event) ~ group,
+                data    = kmDF,
+                subset  = VaccineGroup %in% "DNA")
+
+plotLabel <- paste0("Log-rank test: p=",
+                    signif(pchisq(q          = dif$chisq,
+                                  df         = length(dif$n) - 1,
+                                  lower.tail = FALSE),
+                           digits = 3))
+
+plotDF <- mget(c("time", "surv", "n.censor"), env = as.environment(fit)) %>%
+  as.data.frame() %>%
+  mutate(strata = rep(names(fit$strata), times = fit$strata)) %>%
+  rbind(data.frame(time     = 0,
+                   surv     = 1,
+                   n.censor = 0,
+                   strata   = names(fit$strata))) %>%
+  mutate(VaccineGroup = "DNA & Env")
+
+plotDF <- mutate(plotDF,
+                 strata = gsub(pattern = ".+=(.+)",
+                               replacement = "\\1",
+                               strata),
+                 surv = surv * 100)
+plotKM <- ggplot() +
+  geom_step(data    = plotDF,
+            mapping = aes(x = time, y = surv, color = strata),
+            size    = 1) +
+  geom_point(data    = filter(plotDF, n.censor != 0),
+             mapping = aes(x = time, y = surv),
+             shape   = 4,
+             size    = 3,
+             color   = "blue") +
+  scale_color_manual(name = "", values = c("black", "blue")) +
+  scale_x_continuous(expand = c(0, 0),
+                     limits = c(0, 16),
+                     breaks = seq(from = 0, to = 15, by = 1)) +
+  scale_y_continuous(expand = c(0, 0),
+                     breaks = seq(from = 0, to = 100, by = 10)) +
+  labs(x     = "# of challenges",
+       y     = "Percent uninfected",
+       title = "Ad5+DNA vs concurrent controls") +
+  annotate(geom  = "text",
+           x     = 10,
+           y     = 75,
+           label = plotLabel,
+           size  = 3.5,
+           hjust = 0) +
+  theme_bw() +
+  theme(legend.position      = c(0.7, 0.9),
+        legend.justification = c(0.25, 0.5),
+        axis.line            = element_line(color = "black"),
+        panel.grid           = element_blank(),
+        panel.border         = element_blank(),
+        plot.title           = element_text(hjust = 0.5),
+        legend.key           = element_blank())
+print(plotKM)
+@
+
+<<print-km-alvac-ctrl, echo=FALSE, eval=FALSE>>=
+kmDF <-  challengeDF %>%
+  mutate(VaccineGroup = gsub(pattern = ".*(ALVAC|DNA).+",
+                             replacement = "\\1",
+                             Group)) %>%
+  select(Macaque, Group, `No. of.challenges`, VaccineGroup) %>%
+  mutate(event = !grepl(pattern = ">15", `No. of.challenges`),
+         event = as.numeric(event),
+         time  = gsub(pattern = ">", replacement = "", `No. of.challenges`),
+         time  = as.numeric(time),
+         group = ifelse(test = grepl(pattern = "Controls", Group),
+                        yes  = "controls",
+                        no   = "vaccinated"))
+fit <- survfit(formula = Surv(time = time, event = event) ~ group,
+               data    = kmDF,
+               subset  = VaccineGroup %in% "ALVAC")
+dif <- survdiff(formula = Surv(time = time, event = event) ~ group,
+                data    = kmDF,
+                subset  = VaccineGroup %in% "ALVAC")
+
+plotLabel <- paste0("Log-rank test: p=",
+                    signif(pchisq(q          = dif$chisq,
+                                  df         = length(dif$n) - 1,
+                                  lower.tail = FALSE),
+                           digits = 3))
+
+plotDF <- mget(c("time", "surv", "n.censor"), env = as.environment(fit)) %>%
+  as.data.frame() %>%
+  mutate(strata = rep(names(fit$strata), times = fit$strata)) %>%
+  rbind(data.frame(time     = 0,
+                   surv     = 1,
+                   n.censor = 0,
+                   strata   = names(fit$strata))) %>%
+  mutate(VaccineGroup = "ALVAC & Env")
+
+plotDF <- mutate(plotDF,
+                 strata = gsub(pattern = ".+=(.+)",
+                               replacement = "\\1",
+                               strata),
+                 surv = surv * 100)
+plotKM <- ggplot() +
+  geom_step(data    = plotDF,
+            mapping = aes(x = time, y = surv, color = strata),
+            size    = 1) +
+  geom_point(data    = filter(plotDF, n.censor != 0),
+             mapping = aes(x = time, y = surv),
+             shape   = 4,
+             size    = 3,
+             color   = "red") +
+  scale_color_manual(name = "", values = c("black", "red")) +
+  scale_x_continuous(expand = c(0, 0),
+                     limits = c(0, 16),
+                     breaks = seq(from = 0, to = 15, by = 1)) +
+  scale_y_continuous(expand = c(0, 0),
+                     breaks = seq(from = 0, to = 100, by = 10)) +
+  labs(x     = "# of challenges",
+       y     = "Percent uninfected",
+       title = "Ad5+ALVAC vs concurrent controls") +
+  annotate(geom  = "text",
+           x     = 10,
+           y     = 75,
+           label = plotLabel,
+           size  = 3.5,
+           hjust = 0) +
+  theme_bw() +
+  theme(legend.position      = c(0.7, 0.9),
+        legend.justification = c(0.25, 0.5),
+        axis.line            = element_line(color = "black"),
+        panel.grid           = element_blank(),
+        panel.border         = element_blank(),
+        plot.title           = element_text(hjust = 0.5),
+        legend.key           = element_blank())
+print(plotKM)
+@
+
+<<test-association-with-challenge, eval=FALSE>>=
+# linear model
+lmStatBinDF <- challengeDF %>%
+  mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  select(-`Date of birth`, -`Date of 1st challenge`, -`Age at 1st challenge`) %>%
+  gather(cname, value, -Macaque, -`No. of.challenges`) %>%
+  group_by(cname) %>%
+  do(p = kruskal.test(formula = `No. of.challenges`~factor(value),
+                       data    = .)$p.value) %>%
+  ungroup() %>%
+  mutate(p = unlist(p))
+lmStatBinDF <- challengeDF %>%
+  mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  select(-`Date of birth`, -`Date of 1st challenge`, -`Age at 1st challenge`) %>%
+  gather(cname, value, -Macaque, -`No. of.challenges`, -Group) %>%
+  group_by(cname, Group) %>%
+  do(p = {
+    fit <- try(kruskal.test(formula = `No. of.challenges`~factor(value),
+                            data    = .),
+               silent = TRUE)
+    if (!("try-error" %in% class(fit))) {
+      fit$p.value
+    } else {
+      NA
+    }}) %>%
+  ungroup() %>%
+  mutate(p = unlist(p))
+lmStatContDF <- challengeDF %>%
+  mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`)) %>%
+  group_by(Group) %>%
+  do(p = cor.test(formula = ~`No. of.challenges`+`Age at 1st challenge`,
+                  data    = .,
+                  method  = "spearman")$p.value) %>%
+  ungroup() %>%
+  mutate(p = unlist(p))
+@
+
+<<read-feature-annotation, eval=FALSE>>=
+colNames <- c("seqname",
+              "source",
+              "feature",
+              "start",
+              "end",
+              "score",
+              "strand",
+              "frame",
+              "attribute")
+colTypes <- paste(c(rep("c", times = 3),
+                    rep("i", times = 2),
+                    rep("c", times = 4)),
+                  collapse = "")
+documentsDir <- file.path(workDir, "documents")
+featuresAnnotationFile <- "genes.gtf"
+skipNb <- read_lines(file = file.path(documentsDir, featuresAnnotationFile))
+skipNb <- sum(grepl(pattern = "^#", skipNb))
+
+featuresAnnot <- read_tsv(file      = file.path(documentsDir,
+                                                featuresAnnotationFile),
+                          skip      = skipNb,
+                          col_names = colNames,
+                          col_types = colTypes)
+# extract gene_id and transcript_id from attributes
+featAnnot <- featuresAnnot %>%
+  mutate(gene_id = gsub(pattern = ".*gene_id \"([^;]+)\";.+",
+                        replacement = "\\1",
+                        attribute),
+         gene_name = ifelse(test = grepl(pattern = "gene_name",
+                                         attribute),
+                            yes = gsub(pattern = ".+gene_name \"([^;]+)\";.+",
+                                       replacement = "\\1",
+                                       attribute),
+                            no  = NA),
+         gene_biotype = ifelse(test = grepl(pattern = "gene_biotype",
+                                         attribute),
+                            yes = gsub(pattern = ".+gene_biotype \"([^;]+)\";.*",
+                                       replacement = "\\1",
+                                       attribute),
+                            no  = NA)) %>%
+  select(seqname, strand, gene_id, gene_name, gene_biotype) %>%
+  distinct() %>%
+  as.data.frame()
+rownames(featAnnot) <- featAnnot$gene_id
+featAnnot <- featAnnot[rownames(countDF), ]
+@
+
+<<merge-sample-annot, eval=FALSE>>=
+samplesAnnot <- merge(x = challengeDF,
+                      y = sampleSheetDF,
+                      by.x = "Macaque",
+                      by.y = "Sample Identification.Donor ID")
+rownames(samplesAnnot) <- samplesAnnot$"Sample Identification.CWRU ID"
+samplesAnnot <- samplesAnnot[colnames(countDF), ]
+# add total reads counted
+samplesAnnot$TotalReads <- colSums(countDF)
+@
+
+<<build-raw-seqset, eval=FALSE>>=
+# build  raw ExpressionSet
+esetRaw <- newSeqExpressionSet(counts      = as.matrix(countDF),
+                               featureData = AnnotatedDataFrame(featAnnot),
+                               phenoData   = AnnotatedDataFrame(samplesAnnot))
+dataDir <- "data"
+save(esetRaw, file = file.path(dataDir, "esetRaw.guroff.RData"))
+@
+
+<<load-raw-seqeset, echo=FALSE>>=
+load(file = "data/esetRaw.guroff.RData")
+@
+
+<<qc-align-stat, eval=FALSE>>=
+statDF <- read_tsv(file      = file.path(workDir, "documents/ReadStats.txt"),
+                   col_names = FALSE) %>%
+  distinct() %>%
+  spread(X3, X2)
+plotDF <- countDF %>% 
+  colSums() %>%
+  data.frame(Counted = .) %>%
+  rownames_to_column() %>%
+  merge(x = statDF, by.x = "X1", by.y = "rowname")
+
+plotDF <- plotDF %>%
+  mutate(Trimmed    = TotalReads - Surviving,
+         NotMapped  = Surviving - UniqMapped - Multimapped,
+         NotCounted = UniqMapped + Multimapped - Counted) %>%
+  select(Trimmed, NotMapped, NotCounted, Counted, X1) %>%
+  gather(key, value, -X1)
+plotHist <- ggplot(data = plotDF,
+                   mapping = aes(x = X1, y = value, fill = key)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Samples", y = "Number of reads") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+print(plotHist)
+@ 
+
+<<qc-mRNA, eval=FALSE>>=
+plotDF <- countDF %>%
+  rownames_to_column() %>%
+  merge(y    = select(featAnnot, gene_id, gene_biotype),
+        by.x = "rowname",
+        by.y = "gene_id") %>%
+  gather(sample, value, -rowname, -gene_biotype) %>%
+  group_by(sample, gene_biotype) %>%
+  summarize(eta = sum(value),
+            mu  = mean(value),
+            q2  = median(value))
+ 
+plotBar2 <- ggplot(data = plotDF,
+                   mapping = aes(x = sample, y = eta, fill = gene_biotype)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(expand = c(0, 0)) +
+  labs(x = "Samples", y = "Number of reads") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+print(plotBar2)
+@ 
+
+gender-check
+<<gender-check, eval=FALSE>>=
+plotDF <- counts(eset)[grepl(pattern = "Y", fData(eset)$seqname), ] %>%
+  colMeans() %>%
+  data.frame(chrY = .) %>%
+  cbind(pData(eset))
+
+plotJit <- ggplot(data = plotDF,
+                  mapping = aes(x = Sex, y = chrY)) +
+  geom_boxplot(fill = "grey", outlier.color = "transparent") +
+  geom_jitter(width = 0.25, height = 0) +
+  labs(y = "Average chrY raw counts") +
+  theme_bw()
+plot(plotJit)
+
+wilcox.test(formula = chrY ~ Sex, data = plotDF)
+@ 
+
+<<mds-raw, eval=FALSE>>=
+rawMat <- counts(esetRaw)
+mat <- rawMat[rowSums(rawMat) > 0, ]
+mat <- log2(mat + 0.25)
+distMat <- dist(t(mat))
+fit <- cmdscale(distMat, k = 2, eig = TRUE)
+plotDF <- as.data.frame(fit$points)
+plotDF <- plotDF %>%
+  mutate(SampleName = colnames(mat),
+         TotalRead = colSums(rawMat)) %>%
+  merge(y = pData(esetRaw),
+        by.x = "SampleName",
+        by.y = "Sample Identification.CWRU ID") %>%
+  mutate(Library.Date = factor(Library.Date))
+plotScat <- ggplot(data    = plotDF,
+                   mapping = aes(x     = V1,
+                                 y     = V2,
+                                 label = SampleName,
+                                 color = TotalRead,
+                                 shape = Library.Date)) +
+  geom_point(size = 4) +
+  labs(x = paste0("1st dimension (",
+                        round((fit$eig/sum(fit$eig))[1] * 100),
+                        "%)"),
+                    y = paste0("2nd dimension (",
+                        round((fit$eig/sum(fit$eig))[2] * 100),
+                        "%)")) +
+  scale_color_continuous(low = "lightblue", high = "darkblue") +
+  theme_bw()
+print(plotScat)
+
+flagDF <- pData(esetRaw) %>%
+  gather(cname, value) %>%
+  group_by(cname) %>%
+  summarize(n = length(setdiff(value, NA)),
+            isNum = length(setdiff(as.numeric(value), NA))) %>%
+  mutate(varType = ifelse(test = n > 1 & isNum >= 10,
+                          yes  = "continuous",
+                          no   = "categorical"),
+         varType = ifelse(test = n <= 1,
+                          yes  = NA,
+                          no   = varType),
+         varType = ifelse(test = isNum < 1 & n == ncol(esetRaw),
+                          yes  = NA,
+                          no   = varType)) %>%
+  filter(!is.na(varType))
+# mask sample id
+flagDF <- flagDF %>%
+  mutate(varType = ifelse(test = grepl(pattern = "Randomized.+Number|Tube ID",
+                                       cname),
+                          yes  = NA,
+                          no   = varType))
+
+# fix continuous variable w/ string characters
+filter(flagDF, varType %in% "continuous" & isNum != n)
+plotDF <- mutate(plotDF,
+                 `Globin RNA Removal.Ratio [28S:18S]` = 
+                   as.numeric(`Globin RNA Removal.Ratio [28S:18S]`),
+                 `No. of.challenges` = gsub(pattern = ">15",
+                                            replacement = 16,
+                                            `No. of.challenges`),
+                 `No. of.challenges` = as.numeric(`No. of.challenges`))
+contVars <- flagDF %>%
+  filter(varType %in% "continuous") %>%
+  .$cname
+contStatDF <- plotDF %>%
+  select(V1, V2, contVars) %>%
+  gather(cname, value, -V1, -V2) %>%
+  gather(tname, tvalue, -cname, -value) %>%
+  group_by(tname, cname) %>%
+  do(p = cor.test(formula = ~tvalue+value,
+                  data    = .,
+                  method  = "spearman")$p.value) %>%
+  ungroup() %>%
+  mutate(p = unlist(p)) %>%
+  arrange(tname, p)
+
+sigLS <- filter(contStatDF, p <= 0.05) %>%
+  .$cname %>%
+  unique()
+
+for (cname in sigLS) {
+  plotTemp <- plotDF
+  plotTemp$y <- as.numeric(plotDF[[cname]])
+  plotScat <- ggplot(data    = plotTemp,
+                   mapping = aes(x     = V1,
+                                 y     = V2,
+                                 color = y)) +
+  geom_point(size = 4) +
+  scale_colour_continuous(name = cname) +
+  theme_bw()
+  print(plotScat)
+}
+
+categVars <- flagDF %>%
+  filter(varType %in% "categorical") %>%
+  .$cname
+categStatDF <- plotDF %>%
+  select(V1, V2, categVars) %>%
+  gather(cname, value, -V1, -V2) %>%
+  gather(tname, tvalue, -cname, -value) %>%
+  group_by(tname, cname) %>%
+  do(p = kruskal.test(formula = tvalue~factor(value),
+                  data    = .)$p.value) %>%
+  ungroup() %>%
+  mutate(p = unlist(p)) %>%
+  arrange(tname, p)
+
+sigLS <- filter(categStatDF, p <= 0.05) %>%
+  .$cname %>%
+  unique()
+
+for (cname in sigLS) {
+  plotTemp <- plotDF
+  plotTemp$y <- factor(plotDF[[cname]])
+  plotScat <- ggplot(data    = plotTemp,
+                   mapping = aes(x     = V1,
+                                 y     = V2,
+                                 color = y)) +
+  geom_point(size = 4) +
+  scale_colour_discrete(name = cname) +
+  theme_bw()
+  print(plotScat)
+}
+@
+
+<<normalize-counts, eval=FALSE>>=
+dge <- DGEList(counts       = counts(esetRaw),
+               remove.zeros = TRUE)
+dge <- calcNormFactors(object = dge, method = "TMM")
+normalizedCounts <- cpm(dge, normalized.lib.sizes = TRUE, log = TRUE)
+normalizedCounts <- round(normalizedCounts, 0)
+eset <-  newSeqExpressionSet(
+    counts           = dge$counts,
+    normalizedCounts = as.matrix(normalizedCounts),
+    featureData      = fData(esetRaw)[rownames(normalizedCounts), ],
+    phenoData        = pData(esetRaw))
+dataDir <- "data"
+save(eset, file = file.path(dataDir, "eset.guroff.RData"))
+@ 
+
+<<load-eset, echo=FALSE>>=
+load(file = "data/eset.guroff.RData")
+@ 
+
+<<mds-norm-by-batch, eval=FALSE>>=
+# mds normalized/cpm counts
+esetTemp <- eset
+esetTemp$Library.Date <- as.character(esetTemp$Library.Date)
+esetTemp <- esetTemp[, !grepl("REPEATED", esetTemp$Library.Note)]
+for (Date in unique(esetTemp$Library.Date)) {
+  mat <- normCounts(esetTemp[, esetTemp$Library.Date %in% Date])
+  distMat <- dist(t(mat))
+  fit <- cmdscale(distMat, k = 2, eig = TRUE)
+  plotDF <- as.data.frame(fit$points) %>%
+    rownames_to_column() %>%
+    merge(x = pData(esetTemp),
+          by.x = "Sample Identification.CWRU ID",
+          by.y = "rowname")
+  plotLabel <- round((fit$eig/sum(fit$eig)) * 100)
+  plotLabel <- plotLabel[1:2]
+  plotLabel <- paste0(c("1st dimension (", "2nd dimension ("),
+                      plotLabel,
+                      "%)")
+  plotScat <- ggplot(data = plotDF,
+                   mapping = aes(x = V1,
+                                 y = V2,
+                                 color = Group,
+                                 shape = `Sample Identification.Time Point`)) +
+    geom_point(size = 4) +
+    labs(x = plotLabel[[1]],
+         y = plotLabel[[2]],
+         title = Date) +
+    theme_bw() +
+    theme(legend.key = element_blank(),
+          plot.title = element_text(hjust = 0.5))
+  print(plotScat)
+}
+@ 
+
+<<combat>>=
+esetRaw$Batch <- factor(esetRaw$Library.Date)
+# sample repeated on 2017.06.16 cluster with 2017.06.07
+esetRaw$Batch[grepl(pattern = "REPEAT", esetRaw$Library.Note)] <- "2017-06-07"
+dge <- DGEList(counts       = counts(esetRaw),
+               remove.zeros = TRUE)
+design1 <- model.matrix(~Group, data = pData(esetRaw))
+design2 <- model.matrix(~`Sample Identification.Time Point`,
+                        data = pData(esetRaw))
+design <- cbind(design1, design2)
+check <- apply(design, MARGIN = 2, function(x) all(x == 1))
+design <- as.matrix(design[, !check])
+dge <- calcNormFactors(object = dge, method = "TMM")
+normalizedCounts <- cpm(dge, normalized.lib.sizes = TRUE, log = TRUE)
+combat <- ComBat(dat   = normalizedCounts,
+                 batch = esetRaw$Batch,
+                 mod   = design)
+esetCombat <-  newSeqExpressionSet(
+    counts           = counts(esetRaw)[rownames(combat), colnames(combat)],
+    normalizedCounts = as.matrix(combat),
+    featureData      = fData(esetRaw)[rownames(combat), ],
+    phenoData        = pData(esetRaw)[colnames(combat), ])
+dataDir <- "data"
+save(esetCombat, file = file.path(dataDir, "esetCombat.guroff.RData"))
+@ 
+
+<<load-eset-combat>>=
+load(file = "data/esetCombat.guroff.RData")
+@
+
+<<mds-combat, eval=FALSE>>=
+# mds combat                                                                          
+mat <- normCounts(esetCombat)
+distMat <- dist(t(mat))
+fit <- cmdscale(distMat, k = 2, eig = TRUE)
+plotDF <- as.data.frame(fit$points) %>%
+  cbind(pData(esetCombat)) %>%
+  mutate(Library.Date = factor(Library.Date))
+plotLabel <- round((fit$eig/sum(fit$eig)) * 100)
+plotLabel <- plotLabel[1:2]
+plotLabel <- paste0(c("1st dimension (", "2nd dimension ("),
+                    plotLabel,
+                    "%)")
+plotScat <- ggplot(data = plotDF,
+                   mapping = aes(x = V1,
+                                 y = V2,
+                                 color = Group,
+                                 shape = `Sample Identification.Time Point`)) +
+  geom_point(size = 4) +
+  labs(x = plotLabel[[1]],
+       y = plotLabel[[2]]) +
+  theme_bw() +
+  theme(legend.key = element_blank())
+print(plotScat)
+@
+
+<<diff-expression, echo=FALSE>>=
+esetRaw$Batch <- factor(make.names(esetRaw$Library.Date))
+# sample repeated on 2017.06.16 cluster with 2017.06.07
+esetRaw$Batch[grepl(pattern = "REPEAT", esetRaw$Library.Note)] <- "X2017.06.07"
+
+fits <- list()
+# vaccine effect
+esetTemp <- esetRaw
+vax <- pData(esetTemp) %>%
+  mutate(vax  = gsub(pattern = ".*(ALVAC|DNA).+",
+                     replacement = "\\1",
+                     Group),
+         vax  = ifelse(test = grepl(pattern = "Control", Group),
+                       yes  = paste0(vax, ".Control"),
+                       no   = vax)) %>%
+  .$vax
+time <- c("Pre Vacc" = "pre",
+          "wk12 + 1d" = "post2nd",
+          "wk36 + 1d" = "post4th")[esetTemp$"Sample Identification.Time Point"]
+group <- interaction(vax, time, drop = TRUE)
+batch <- make.names(esetTemp$Batch)
+designMat <- model.matrix(~0 + group + batch)
+rownames(designMat) <- sampleNames(esetTemp)
+colnames(designMat) <- gsub(pattern     = "group",
+                            replacement = "",
+                            colnames(designMat))
+attr(designMat, "assign") <- attr(designMat, "contrasts") <- NULL
+suppressMessages(dgeTemp <- DGEList(counts       = counts(esetTemp),
+                                    remove.zeros = TRUE))
+dgeTemp <- calcNormFactors(object = dgeTemp, method = "TMM")
+dgeTemp <- estimateGLMCommonDisp(y = dgeTemp, design = designMat)
+dgeTemp <- estimateGLMTrendedDisp(y = dgeTemp, design = designMat)
+dgeTemp <- estimateGLMTagwiseDisp(y = dgeTemp, design = designMat)
+fit <- glmFit(y = dgeTemp, design = designMat)
+fit$genes <- fData(esetTemp)[rownames(fit$coef), ]
+contrastDF <- data.frame(V1 = c("ALVAC", "ALVAC", "DNA", "ALVAC.Control"),
+                         V2 = c("DNA", "ALVAC.Control", "DNA.Control", "DNA.Control"))
+contrastLS <- NULL
+for (TIME in unique(time)) {
+  contrastDF %>% 
+    mutate(contrast = paste0(V1, ".", TIME, "-", V2, ".", TIME)) %>%
+    .$contrast %>%
+    c(contrastLS, .) -> contrastLS
+}
+# add double contrast
+for (TIME in unique(time)) {
+  paste0("(ALVAC.", TIME, "-ALVAC.Control.", TIME, 
+         ")-(DNA.", TIME, "-DNA.Control.", TIME, ")") %>%
+    c(contrastLS, .) -> contrastLS
+}
+contrast <-  makeContrasts(contrasts = contrastLS, levels = fit$design)
+fit$contrast <- contrast
+fits[["vax"]] <- list(fit = fit)
+
+# immunization effect (blocked by donor)
+for (VAX in unique(esetRaw$Group)) {
+  esetTemp <- esetRaw[, esetRaw$Group %in% VAX]
+  time <- c("Pre Vacc" = "pre",
+            "wk12 + 1d" = "post2nd",
+            "wk36 + 1d" = "post4th")[esetTemp$"Sample Identification.Time Point"]
+  donor <- factor(make.names(esetTemp$Macaque))
+  batch <- esetTemp$Batch
+  designMat <- model.matrix(~0 + time + donor + batch)
+  rownames(designMat) <- sampleNames(esetTemp)
+  colnames(designMat) <- gsub(pattern     = "time",
+                            replacement = "",
+                            colnames(designMat))
+  attr(designMat, "assign") <- attr(designMat, "contrasts") <- NULL
+  suppressMessages(dgeTemp <- DGEList(counts       = counts(esetTemp),
+                                      remove.zeros = TRUE))
+  dgeTemp <- calcNormFactors(object = dgeTemp, method = "TMM")
+  dgeTemp <- estimateGLMCommonDisp(y = dgeTemp, design = designMat)
+  dgeTemp <- estimateGLMTrendedDisp(y = dgeTemp, design = designMat)
+  dgeTemp <- estimateGLMTagwiseDisp(y = dgeTemp, design = designMat)
+  fit <- glmFit(y = dgeTemp, design = designMat)
+  fit$genes <- fData(esetTemp)[rownames(fit$coef), ]
+  contrastLS <- c("post2nd-pre",
+                  "post4th-pre",
+                  "post4th-post2nd")
+  contrast <-  makeContrasts(contrasts = contrastLS, levels = fit$design)
+  fit$contrast <- contrast
+  vax <- gsub(pattern = ".*(ALVAC|DNA).+", replacement = "\\1", VAX)
+  if (grepl(pattern = "Control", VAX)) 
+    vax <- paste0(vax, ".Control")
+  fits[[vax]] <- list(fit = fit)
+}
+
+# challenge by vax and immunization
+for (VAX in unique(esetRaw$Group)) {
+  for (TIME in unique(esetRaw$"Sample Identification.Time Point")) {
+    esetTemp <- esetRaw[, esetRaw$Group %in% VAX &
+                          esetRaw$"Sample Identification.Time Point" %in% TIME]
+    challenge <- esetTemp$"No. of.challenges" %>%
+      gsub(pattern = ">15", replacement = 16) %>%
+      as.numeric()
+    batch <- factor(as.vector(esetTemp$Batch))
+    designMat <- model.matrix(~challenge+batch)
+    rownames(designMat) <- sampleNames(esetTemp)
+    suppressMessages(dgeTemp <- DGEList(counts       = counts(esetTemp),
+                                        remove.zeros = TRUE))
+    dgeTemp <- calcNormFactors(object = dgeTemp, method = "TMM")
+    dgeTemp <- estimateGLMCommonDisp(y = dgeTemp, design = designMat)
+    dgeTemp <- estimateGLMTrendedDisp(y = dgeTemp, design = designMat)
+    dgeTemp <- estimateGLMTagwiseDisp(y = dgeTemp, design = designMat)
+    fit <- glmFit(y = dgeTemp, design = designMat)
+    fit$genes <- fData(esetTemp)[rownames(fit$coef), ]
+    vax <- gsub(pattern = ".*(ALVAC|DNA).+", replacement = "\\1", VAX)
+    if (grepl(pattern = "Control", VAX)) 
+      vax <- paste0(vax, ".Control")
+    time <- c("Pre Vacc" = "pre",
+              "wk12 + 1d" = "post2nd",
+              "wk36 + 1d" = "post4th")[TIME]
+    modelName <- paste0(vax, ".", time, "_challenge")
+    fits[[modelName]] <- list(fit = fit)
+  }
+}
+# save fits
+save(fits, file = "data/fits.guroff.RData")
+@
+
+<<load-fits>>=
+load(file = "data/fits.guroff.RData")
+@
+
+<<print-nb-deg, eval=FALSE>>=
+# print number of genes differently expressed
+degNbDF <- NULL 
+for (modelName in grep("challenge", names(fits), invert = TRUE, value = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  for (coefName in colnames(fit$contrast)) {
+    fit2 <- glmLRT(glmfit = fit, contrast = fit$contrast[, coefName])
+    topTags(fit2, n = Inf) %>%
+      as.data.frame() %>%
+      filter(logCPM > 0 & gene_biotype %in% "protein_coding") %>%
+      group_by(sign(logFC)) %>%
+      summarize(p     = sum(PValue <= 0.05),
+                adj.p = sum(FDR <= 0.05)) %>%
+      mutate(modelName = modelName,
+             coefficient = coefName) %>%
+      rbind(degNbDF) -> degNbDF
+  }
+}
+for (modelName in grep("challenge", names(fits), value = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  coefName <- colnames(fit$design)[2]
+  fit2 <- glmLRT(glmfit = fit, coef = "challenge")
+  topTags(fit2, n = Inf) %>%
+    as.data.frame() %>%
+    filter(logCPM > 0 & gene_biotype %in% "protein_coding") %>%
+    group_by(sign(logFC)) %>%
+    summarize(p     = sum(PValue <= 0.05),
+              adj.p = sum(FDR <= 0.05)) %>%
+    mutate(modelName   = modelName,
+           coefficient = coefName) %>%
+    rbind(degNbDF) -> degNbDF
+}
+
+degNbDF %>%
+  gather(cname, n, -modelName, -coefficient, -`sign(logFC)`) %>%
+  mutate(`sign(logFC)` = c("-1" = "DN", "1" = "UP")[as.character(`sign(logFC)`)],
+         cname         = paste0(cname, `sign(logFC)`)) %>%
+  select(-`sign(logFC)`) %>%
+  spread(cname, n) %>%
+  mutate(p = paste0(pUP, "/", pDN),
+         adj.p = paste0(adj.pUP, "/", adj.pDN)) %>%
+  select(modelName, coefficient, p, adj.p) %>%
+  write_csv(path = "nbdeg.csv")
+@
+
+<<heatmap-deg-top50, eval=FALSE>>=
+for (modelName in grep(pattern = "challenge",
+                       names(fits),
+                       value   = TRUE,
+                       invert  = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  for (coefName in colnames(fit$contrast)) {
+    fit2 <- glmLRT(glmfit = fit, contrast = fit$contrast[, coefName])
+    top <- topTags(fit2, n = Inf) %>%
+      as.data.frame() %>%
+      filter(logCPM > 0 & gene_biotype %in% "protein_coding") %>%
+      top_n(50, wt = LR) %>%
+      arrange(desc(logFC)) %>%
+      mutate(gene_name = ifelse(test = is.na(gene_name),
+                                yes  = gene_id,
+                                no   = gene_name))
+    sampleLS <- which(fit$contrast[, coefName] != 0) %>%
+      fit$design[, .] %>%
+      as.data.frame() %>%
+      rownames_to_column() %>%
+      gather(group, value, -rowname) %>%
+      group_by(rowname) %>%
+      summarize(value = sum(value)) %>%
+      filter(value > 0) %>%
+      .$rowname
+    mat <- normCounts(esetCombat)[top$gene_id, sampleLS] %>%
+      t() %>%
+      scale() %>%
+      t()
+    colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+    breakLS <- c(-1 * max(abs(mat)),
+                 seq(from = -1 * min(abs(range(mat))),
+                     to   = min(abs(range(mat))),
+                     length.out = 99),
+                 max(abs(mat)))
+    matAnnot <- pData(esetCombat) %>%
+      select(Group, 'Sample Identification.Time Point', Batch,
+             `No. of.challenges`) %>%
+      mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                        replacement = 16,
+                                        `No. of.challenges`),
+             `No. of.challenges` = as.numeric(`No. of.challenges`))
+    rownames(matAnnot) <- sampleNames(esetCombat)
+    pheatmap(mat            = mat,
+             color          = colorLS,
+             breaks         = breakLS,
+             cellwidth      = 6,
+             cellheight     = 6,
+             cluster_rows   = FALSE,
+             annotation_col = matAnnot,
+             main           = paste0(modelName, ": ", coefName),
+             fontsize       = 6,
+             labels_row     = top$gene_name)
+  }
+}
+
+for (modelName in grep(pattern = "challenge", names(fits), value = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  fit2 <- glmLRT(glmfit = fit, coef = "challenge")
+  top <- topTags(fit2, n = Inf) %>%
+    as.data.frame() %>%
+    filter(logCPM > 0 & gene_biotype %in% "protein_coding") %>%
+    top_n(50, wt = LR) %>%
+    arrange(desc(logFC)) %>%
+    mutate(gene_name = ifelse(test = is.na(gene_name),
+                              yes  = gene_id,
+                              no   = gene_name))
+  sampleLS <- rownames(fit$design)
+  mat <- normCounts(esetCombat)[top$gene_id, sampleLS] %>%
+    t() %>%
+    scale() %>%
+    t()
+  meanRank <- apply(mat * sign(top$logFC), MARGIN = 1, FUN = rank) %>%
+    rowMeans()
+  colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+  breakLS <- c(-1 * max(abs(mat)),
+                 seq(from = -1 * min(abs(range(mat))),
+                     to   = min(abs(range(mat))),
+                     length.out = 99),
+                 max(abs(mat)))
+  matAnnot <- pData(esetCombat) %>%
+      select(Group, 'Sample Identification.Time Point', Batch,
+             `No. of.challenges`) %>%
+      mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                        replacement = 16,
+                                        `No. of.challenges`),
+             `No. of.challenges` = as.numeric(`No. of.challenges`))
+  rownames(matAnnot) <- sampleNames(eset)
+  pheatmap(mat            = mat[, order(meanRank)],
+           color          = colorLS,
+           breaks         = breakLS,
+           cellwidth      = 6,
+           cellheight     = 6,
+           cluster_rows   = FALSE,
+           cluster_cols   = FALSE,
+           annotation_col = matAnnot,
+           main           = modelName,
+           fontsize       = 6,
+           labels_row     = top$gene_name)
+}
+@ 
+
+<<deg-heat-fdr>>=
+for (modelName in grep(pattern = "challenge",
+                       names(fits),
+                       value   = TRUE,
+                       invert  = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  for (coefName in colnames(fit$contrast)) {
+    fit2 <- glmLRT(glmfit = fit, contrast = fit$contrast[, coefName])
+    top <- topTags(fit2, n = Inf, p.value = 0.05) %>%
+      as.data.frame() %>%
+      filter(logCPM > 0 & gene_biotype %in% "protein_coding")
+    if (nrow(top) > 0) {
+      top <- top %>%
+        arrange(desc(logFC)) %>%
+        mutate(gene_name = ifelse(test = is.na(gene_name),
+                                  yes  = gene_id,
+                                  no   = gene_name))
+      sampleLS <- which(fit$contrast[, coefName] != 0) %>%
+        fit$design[, .] %>%
+        as.data.frame() %>%
+        rownames_to_column() %>%
+        gather(group, value, -rowname) %>%
+        group_by(rowname) %>%
+        summarize(value = sum(value)) %>%
+        filter(value > 0) %>%
+        .$rowname
+      mat <- normCounts(esetCombat)[top$gene_id, sampleLS, drop = FALSE] %>%
+        t() %>%
+        scale() %>%
+        t()
+      colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+      breakLS <- c(-1 * max(abs(mat)),
+                   seq(from = -1 * min(abs(range(mat))),
+                       to   = min(abs(range(mat))),
+                       length.out = 99),
+                   max(abs(mat)))
+      matAnnot <- pData(esetCombat) %>%
+        select(Group, 'Sample Identification.Time Point', Batch,
+               `No. of.challenges`) %>%
+        mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                          replacement = 16,
+                                          `No. of.challenges`),
+               `No. of.challenges` = as.numeric(`No. of.challenges`))
+      rownames(matAnnot) <- sampleNames(esetCombat)
+      cellHeight <- 6
+      labelsRow <- top$gene_name
+      if (nrow(top) > 50) {
+        cellHeight <- 500/nrow(top)
+        rownames(mat) <- NULL
+        labelsRow <- NULL
+      }
+      pheatmap(mat            = mat,
+               color          = colorLS,
+               breaks         = breakLS,
+               cellwidth      = 6,
+               cellheight     = cellHeight,
+               cluster_rows   = FALSE,
+               annotation_col = matAnnot,
+               main           = paste0(modelName, ": ", coefName),
+               fontsize       = 6,
+               labels_row     = labelsRow)
+    }
+  }
+}
+
+for (modelName in grep(pattern = "challenge", names(fits), value = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  fit2 <- glmLRT(glmfit = fit, coef = "challenge")
+  top <- topTags(fit2, n = Inf, p.value = 0.05) %>%
+    as.data.frame() %>%
+    filter(logCPM > 0 & gene_biotype %in% "protein_coding") 
+  
+  if (nrow(top) > 0) {
+    top <- top %>%
+      arrange(desc(logFC)) %>%
+      mutate(gene_name = ifelse(test = is.na(gene_name),
+                                yes  = gene_id,
+                                no   = gene_name))
+    sampleLS <- rownames(fit$design)
+    mat <- normCounts(esetCombat)[top$gene_id, sampleLS, drop = FALSE] %>%
+    t() %>%
+    scale() %>%
+    t()
+    meanRank <- apply(mat * sign(top$logFC), MARGIN = 1, FUN = rank) %>%
+      rowMeans()
+    colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+    breakLS <- c(-1 * max(abs(mat)),
+                 seq(from = -1 * min(abs(range(mat))),
+                     to   = min(abs(range(mat))),
+                     length.out = 99),
+                 max(abs(mat)))
+  matAnnot <- pData(esetCombat) %>%
+      select(Group, 'Sample Identification.Time Point', Batch,
+             `No. of.challenges`) %>%
+      mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                        replacement = 16,
+                                        `No. of.challenges`),
+             `No. of.challenges` = as.numeric(`No. of.challenges`))
+  rownames(matAnnot) <- sampleNames(esetCombat)
+  pheatmap(mat            = mat[, order(meanRank), drop = FALSE],
+           color          = colorLS,
+           breaks         = breakLS,
+           cellwidth      = 6,
+           cellheight     = 6,
+           cluster_rows   = FALSE,
+           cluster_cols   = FALSE,
+           annotation_col = matAnnot,
+           main           = modelName,
+           fontsize       = 6,
+           labels_row     = top$gene_name)
+  }
+}
+
+@ 
+
+<<vax-heat-f>>=
+modelName <- "vax"
+fit <- fits[[modelName]][["fit"]]
+contrastLS <- grep(pattern = "Control.+Control",
+                   colnames(fit$contrast),
+                   invert = TRUE,
+                   value  = TRUE)
+fit2 <- glmLRT(glmfit = fit, contrast = fit$contrast[, contrastLS])
+top <- topTags(fit2, n = Inf, p.value = 0.05) %>%
+  as.data.frame() %>%
+  filter(logCPM > 0 & gene_biotype %in% "protein_coding")
+top <- top %>%
+  arrange(desc(LR)) %>%
+  mutate(gene_name = ifelse(test = is.na(gene_name),
+                            yes  = gene_id,
+                            no   = gene_name))
+sampleLS <- which(rowSums(fit$contrast[, contrastLS] != 0) > 0) %>%
+  fit$design[, .] %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  gather(group, value, -rowname) %>%
+  group_by(rowname) %>%
+  summarize(value = sum(value)) %>%
+  filter(value > 0) %>%
+  .$rowname
+mat <- normCounts(esetCombat)[top$gene_id, sampleLS, drop = FALSE] %>%
+  t() %>%
+  scale() %>%
+  t()
+colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+breakLS <- c(-1 * max(abs(mat)),
+             seq(from = -1 * min(abs(range(mat))),
+                 to   = min(abs(range(mat))),
+                 length.out = 99),
+             max(abs(mat)))
+matAnnot <- pData(esetCombat) %>%
+  select(Group, 'Sample Identification.Time Point', Batch,
+         `No. of.challenges`) %>%
+  mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`))
+rownames(matAnnot) <- sampleNames(esetCombat)
+cellHeight <- 250/nrow(top)
+rownames(mat) <- NULL
+labelsRow <- NULL
+pheatmap(mat            = mat,
+         color          = colorLS,
+         breaks         = breakLS,
+         cellwidth      = 2,
+         cellheight     = cellHeight,
+         annotation_col = matAnnot,
+         main           = paste0(modelName, ": F"),
+         fontsize       = 6,
+         labels_row     = labelsRow,
+         show_colnames  = FALSE)
+@ 
+
+<<test-overlap>>=
+sigLS <- list()
+for (modelName in grep(pattern = "challenge", names(fits), value = TRUE)) {
+  fit <- fits[[modelName]][["fit"]]
+  fit2 <- glmLRT(glmfit = fit, coef = "challenge")
+  topTags(fit2, n = Inf) %>%
+    as.data.frame() %>%
+    filter(logCPM > 0 & PValue <= 0.05) %>%
+    mutate(sign = ifelse(test = sign(logFC) %in% 1,
+                         yes  = paste0(modelName, ".UP"),
+                         no   = paste0(modelName, ".DN"))) %>%
+    select(gene_id, sign) %>%
+    unstack() %>%
+    c(sigLS) -> sigLS
+}
+sigTemp <- sigLS[grep(pattern = "DN", names(sigLS))]
+combMat <- combn(x = 1:4, m = 2)
+bg <- fit$gene$gene_id
+fisherDF <- NULL
+for (i in 1:ncol(combMat)) {
+  tab <- table(factor(bg %in% sigTemp[[combMat[1, i]]], levels = c(TRUE, FALSE)),
+               factor(bg %in% sigTemp[[combMat[2, i]]], levels = c(TRUE, FALSE)))
+  fisherDF <- cbind(fisherDF,
+                    c(Obs = tab[1, 1],
+                      Exp = (rowSums(tab) * colSums(tab) / sum(tab))[1],
+                      p   = fisher.test(tab, alternative = "greater")$p.value))
+}
+@ 

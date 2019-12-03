@@ -1,0 +1,172 @@
+\documentclass{article}
+
+\usepackage{geometry}
+\geometry{verbose,
+          tmargin = 2.5cm,
+          bmargin = 2.5cm,
+          lmargin = 2.5cm,
+          rmargin = 2.5cm}
+
+\begin{document}
+
+\title{NI review: multi omics}
+\author{Slim Fourati}
+\date{\today}
+\maketitle
+
+<<load-package, echo=FALSE>>=
+library(package = "GEOquery")
+library(package = "limma")
+library(package = "pheatmap")
+library(package = "dplyr")
+library(package = "tibble")
+library(package = "tidyr")
+#library(package = "Biobase")
+#library(package = "ggplot2")
+#library(package = "limma")
+@ 
+
+<<session-options, echo=FALSE>>=
+options(stringsAsFactors = FALSE)
+workDir <- "/Users/sxf279/Desktop/Projects/20171124_Guroff/Workspace"
+@ 
+
+<<create-virtual-study, echo=FALSE, eval=FALSE>>=
+gset <- getGEO("GSE46955", GSEMatrix = TRUE, getGPL = TRUE)[[1]]
+@ 
+
+<<diff-expr>>=
+# Fig1 genes
+gsetTemp <- gset[, gset$"treatment:ch1" %in% "None"]
+group <- gsub(pattern = "monocyte-([^-]+).+", 
+              replacement = "\\1",
+              gsetTemp$title)
+designMat <- model.matrix(~0+group)
+colnames(designMat) <- gsub(pattern = "group", replacement = "", colnames(designMat))
+rownames(designMat) <- sampleNames(gsetTemp)
+fit <- lmFit(gsetTemp, design = designMat)
+contrast <- makeContrasts(contrasts = "recovery-sepsis",
+                          levels = fit$design)
+fit2 <- contrasts.fit(fit = fit,contrasts = contrast)
+fit2 <- eBayes(fit = fit2)
+top <- topTable(fit = fit2, coef = 1, number = Inf) %>%
+  as.data.frame() %>%
+  filter(adj.P.Val <= 0.05 & abs(logFC) >= log2(1.5)) 
+top %>%
+  filter(!duplicated(Symbol)) %>%
+  # top_n(n = 1170, wt = desc(abs(t))) %>%
+  group_by(sign(t)) %>%
+  summarize(n())
+gsLS <- top %>%
+  mutate(sign = ifelse(test = t > 0, yes = "UP", no = "DN")) %>%
+  select(Symbol, sign, Entrez_Gene_ID) %>%
+  distinct()
+# Fig 2 genes
+group <- gsub(pattern = "monocyte-([^-]+).+", 
+              replacement = "\\1",
+              gset$title)
+treat <- gset$"treatment:ch1"
+groupTreat <- interaction(group, treat)
+designMat <- model.matrix(~0+groupTreat)
+colnames(designMat) <- gsub(pattern = "groupTreat", replacement = "", colnames(designMat))
+rownames(designMat) <- sampleNames(gset)
+fit <- lmFit(gset, design = designMat)
+contrast <- makeContrasts(contrasts = 
+                            c("recovery.LPS-recovery.None",
+                              "sepsis.LPS-sepsis.None",
+                              "(recovery.LPS-recovery.None)-(sepsis.LPS-sepsis.None)"),
+                          levels = fit$design)
+fit2 <- contrasts.fit(fit = fit,contrasts = contrast)
+fit2 <- eBayes(fit = fit2)
+topRec <- topTable(fit = fit2, coef = 1, number = Inf) %>%
+  as.data.frame() %>%
+  filter(adj.P.Val <= 0.05 & abs(logFC) >= log2(1.5)) %>%
+  filter(!duplicated(Symbol) & !is.na(Entrez_Gene_ID)) %>%
+  select(Symbol, t, Entrez_Gene_ID) %>%
+  distinct()
+topSep <- topTable(fit = fit2, coef = 2, number = Inf) %>%
+  as.data.frame() %>%
+  filter(adj.P.Val <= 0.05 & abs(logFC) >= log2(1.5)) %>% 
+  filter(!duplicated(Symbol) & !is.na(Entrez_Gene_ID)) %>%
+  select(Symbol, t, Entrez_Gene_ID) %>%
+  distinct()
+topRecSpe <- topTable(fit = fit2, coef = 3, number = Inf) %>%
+  as.data.frame() %>%
+  filter(adj.P.Val <= 0.05 & abs(logFC) >= log2(1.5)) %>% 
+  filter(!duplicated(Symbol) & !is.na(Entrez_Gene_ID)) %>%
+  select(Symbol, t, Entrez_Gene_ID) %>%
+  distinct()
+@
+
+<<heatmap-wt>>=
+cNames <- fit$design[, names(which(fit$contrast[, 1] != 0))]
+cNames <- rownames(cNames)[rowSums(cNames) > 0]
+mat <- exprs(gset)[topWT$ensembl_gene_id, cNames]
+# use scalling factor of elderly
+mat <- t(scale(t(log2(mat))))
+mat <- mat[complete.cases(mat), ]
+colAnnotDF <- pData(gset)[, c("genotype:ch1", "treatment:ch1")]
+colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+breakLS  <- seq(from = -1 * max(abs(mat)), to = max(abs(mat)), length.out = 101)
+pheatmap(mat = mat,
+         color = colorLS,
+         breaks = breakLS,
+         treeheight_row = 0,
+         show_rownames = FALSE,
+         annotation_col = colAnnotDF,
+         scale = "none",
+         cellwidth = 10)
+@ 
+
+<<heatmap-ko>>=
+cNames <- fit$design[, names(which(fit$contrast[, 2] != 0))]
+cNames <- rownames(cNames)[rowSums(cNames) > 0]
+mat <- exprs(gset)[topKO$ensembl_gene_id, cNames]
+# use scalling factor of elderly
+mat <- t(scale(t(log2(mat))))
+mat <- mat[complete.cases(mat), ]
+colAnnotDF <- pData(gset)[, c("genotype:ch1", "treatment:ch1")]
+colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+breakLS  <- seq(from = -1 * max(abs(mat)), to = max(abs(mat)), length.out = 101)
+pheatmap(mat = mat,
+         color = colorLS,
+         breaks = breakLS,
+         treeheight_row = 0,
+         show_rownames = FALSE,
+         annotation_col = colAnnotDF,
+         scale = "none",
+         cellwidth = 10)
+@ 
+
+<<heatmap-suptab2>>=
+supTab2File <- file.path("/Users/sxf279/Desktop/Projects/20140703_VaxDB",
+                         "Workspace/input/genesets",
+                         "ChengSC_2014_Science.SupplementaryTable2.json")
+gs <- fromJSON(txt = supTab2File) %>%
+  .$Genesets %>%
+  .$Members %>%
+  unlist()
+mat <- exprs(gset)[fData(gset)$mgi_symbol %in% gs, ]
+# use scalling factor of elderly
+mat <- t(scale(t(log2(mat))))
+mat <- mat[complete.cases(mat), ]
+colAnnotDF <- pData(gset)[, c("genotype:ch1", "treatment:ch1")]
+colorLS <- colorRampPalette(colors = c("blue", "white", "red"))(n = 100)
+breakLS  <- seq(from = -1 * max(abs(mat)), to = max(abs(mat)), length.out = 101)
+pheatmap(mat = mat,
+         color = colorLS,
+         breaks = breakLS,
+         cluster_cols = FALSE,
+         treeheight_row = 0,
+         annotation_col = colAnnotDF,
+         scale = "none",
+         cellwidth = 10,
+         labels_row = fData(gset)[rownames(mat), "mgi_symbol"],
+         labels_col = pData(gset)[colnames(mat), "title"])
+@ 
+
+<<session-info, echo=FALSE, eval=FALSE>>=
+sessionInfo()
+@
+
+\end{document}

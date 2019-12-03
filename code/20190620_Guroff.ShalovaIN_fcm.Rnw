@@ -1,0 +1,488 @@
+\documentclass{article}
+
+\usepackage{geometry}
+\geometry{verbose,
+          tmargin = 2.5cm,
+          bmargin = 2.5cm,
+          lmargin = 2.5cm,
+          rmargin = 2.5cm}
+
+\begin{document}
+\title{VB012: test association between train immunity and monocytes freq}
+\author{Slim Fourati}
+\date{\today}
+\maketitle
+
+<<loading-packages, echo=FALSE>>=
+# loading require packages
+suppressPackageStartupMessages(library(package = "knitr"))
+suppressPackageStartupMessages(library(package = "EDASeq"))
+suppressPackageStartupMessages(library(package = "limma"))
+suppressPackageStartupMessages(library(package = "GSEABase"))
+suppressPackageStartupMessages(library(package = "pheatmap"))
+suppressPackageStartupMessages(library(package = "readxl"))
+suppressPackageStartupMessages(library(package = "zoo"))
+suppressPackageStartupMessages(library(package = "tidyverse"))
+@
+
+<<global-variables, echo=FALSE>>=
+# set default options/variables
+opts_chunk$set(tidy = FALSE)
+options(stringsAsFactors = FALSE,
+        width            = 80)
+workDir <- "/Users/sxf279/Desktop/Projects/20171124_VB012/Workspace"
+gseaDir <- "advanced"
+@
+
+Load post-pre RNA-seq expression
+<<read-dgeglm, echo=FALSE>>=
+# read DGEGLM list and ExpressionSet
+load(file = file.path(workDir, "data/esetCombatBaselined.guroff.RData"))
+print(dims(esetCombatBaselined))
+
+cat("\n\nprint number of samples per timepoints and vax group:")
+pData(esetCombatBaselined) %>%
+  group_by(Group, `Sample Identification.Time Point`) %>%
+  summarize(n()) %>%
+  print()
+@
+
+Read Monica V. FCM data
+<<read-fcm, echo=FALSE>>=
+fcmFile <- file.path(dirname(workDir),
+                     "Correspondences/20190526_VB012.emailMRG",
+                     "VB012 monocytes week 26 data.xlsx")
+cNames <- read_excel(path = fcmFile, sheet = 1, skip = 2,
+                     col_names = FALSE, n_max = 3,
+		     .name_repair = make.names) %>%
+  apply(MARGIN = 1, FUN = na.locf, na.rm = FALSE) %>%
+  apply(MARGIN = 1, FUN = paste, collapse = ".") %>%
+  gsub(pattern = ".+Sample.+", replacement = "Sample") %>%
+  c("NA", ., "AnimalID")
+fcmDF <- read_excel(path = fcmFile, sheet = 1, skip = 5,
+                    col_names = cNames) %>%
+  filter(!is.na(AnimalID)) %>%
+  select(-`NA`) %>%
+  # correct typo in Animal ID
+  mutate(AnimalID = gsub(pattern     = "^36",
+                         replacement = "036",
+                         AnimalID),
+         AnimalID = gsub(pattern     = "M30",
+                         replacement = "H30",
+                         AnimalID))
+pdata <- pData(esetCombatBaselined)
+pdata <- cbind(pdata,
+               fcmDF[match(esetCombatBaselined$Macaque,
+                           table = fcmDF$AnimalID),
+                     c("Subtraced.Classical", "Subtraced.Non Classical")])
+pData(esetCombatBaselined) <- pdata
+# print
+pdata %>%
+  select(Group, Macaque, Subtraced.Classical, `Subtraced.Non Classical`) %>%
+  distinct() %>%
+  gather(Subset, value, -Group, -Macaque) %>%
+  filter(!is.na(value)) %>%
+  group_by(Group, Subset) %>%
+  summarize(n())
+@
+
+Test association between FCM and challenge
+<<read-challenge, echo=FALSE, fig.width=8, fig.height=5, warning=FALSE>>=
+challengeFile <- file.path(dirname(workDir),
+                           "Correspondences/20180207_Guroff.emailMG",
+                           "Animal information(5).xlsx")
+# read animal treatment group
+Group <- read_excel(path      = challengeFile,
+                    col_names = FALSE,
+		    .name_repair = function(x) make.unique(make.names(x))) %>%
+  select(X) %>%
+  rename(group = X) %>%
+  mutate(group = ifelse(test = grepl(pattern = "group", group),
+                        yes  = group,
+                        no   = NA),
+         group = na.locf(group)) %>%
+  .$group
+
+challengeDF <- read_excel(path = challengeFile, skip = 2) %>%
+  mutate(Group = Group[-(1:3)])
+# test fcm w/ challenge
+plotDF <- fcmDF %>%
+  select(-Sample) %>%
+  gather(cname, value, -AnimalID) %>%
+  merge(y = select(challengeDF, Macaque, challenges, Group),
+        by.x = "AnimalID", by.y = "Macaque") %>%
+  mutate(value = as.numeric(value),
+         challenges = gsub(pattern = ">15", replacement = 16, challenges),
+         challenges = as.numeric(challenges))
+statDF <- plotDF %>%
+  group_by(cname, Group) %>%
+  do(rho = cor.test(formula = ~value+challenges,
+                    data = .,
+                    method = "spearman")$estimate,
+     p = cor.test(formula = ~value+challenges,
+                    data = .,
+                  method = "spearman")$p.value) %>%
+  ungroup() %>%
+  mutate(rho = unlist(rho),
+         p = unlist(p),
+         adj.p = p.adjust(p, method = "BH"))
+
+print(filter(statDF, p <= 0.05))
+
+sigDF <- filter(statDF, p <= 0.05) %>%
+  mutate(cond = paste0(cname, ".", Group))
+
+filterDF <- plotDF %>%
+  mutate(cond = paste0(cname, ".", Group)) %>%
+  filter(cond %in% sigDF$cond)
+
+ggplot(data = filterDF,
+       mapping = aes(x = challenges, y = value)) +
+  geom_point(mapping = aes(color = Group)) +
+  facet_wrap(facets = ~cname, scale = "free") +
+  geom_smooth(method = "lm", color = "black") +
+  theme_bw()
+@
+
+Perform differential expression (only ALV group post 4th)
+<<deg-combat-baselined, echo=FALSE, eval=TRUE>>=
+fits2 <- list()
+VAX <- "ALVAC group"
+TIME <- "wk36 + 1d"
+flag <- esetCombatBaselined$Group %in% VAX &
+  esetCombatBaselined$"Sample Identification.Time Point" %in% TIME &
+  !is.na(esetCombatBaselined$Subtraced.Classical)
+esetTemp <- esetCombatBaselined[, flag]
+classical <- as.numeric(esetTemp$Subtraced.Classical)
+designMat <- model.matrix(~classical)
+rownames(designMat) <- sampleNames(esetTemp)
+fit <- lmFit(normCounts(esetTemp), design = designMat)
+fit2 <- eBayes(fit)
+fit2$genes <- fData(esetTemp)[rownames(fit$coef), ]
+vax <- gsub(pattern = ".*(ALVAC|DNA).+", replacement = "\\1", VAX)
+time <- c("Pre Vacc" = "pre",
+          "wk12 + 1d" = "post2nd",
+          "wk36 + 1d" = "post4th")[TIME]
+modelName <- paste0(vax, ".", time, "-pre_classical")
+fits2[[modelName]] <- list(fit = fit, fit2 = fit2)
+
+nonclassical <- as.numeric(esetTemp$"Subtraced.Non Classical")
+designMat <- model.matrix(~nonclassical)
+rownames(designMat) <- sampleNames(esetTemp)
+fit <- lmFit(normCounts(esetTemp), design = designMat)
+fit2 <- eBayes(fit)
+fit2$genes <- fData(esetTemp)[rownames(fit$coef), ]
+vax <- gsub(pattern = ".*(ALVAC|DNA).+", replacement = "\\1", VAX)
+time <- c("Pre Vacc" = "pre",
+          "wk12 + 1d" = "post2nd",
+          "wk36 + 1d" = "post4th")[TIME]
+modelName <- paste0(vax, ".", time, "-pre_nonclassical")
+fits2[[modelName]] <- list(fit = fit, fit2 = fit2)
+
+# print deg
+cat("number of genes correlated (LIMMA t-test: adj.p <= 0.05)")
+top <- NULL
+for (modelName in names(fits2)) {
+  fit2 <- fits2[[modelName]][["fit2"]]
+  coefName <- setdiff(colnames(fit2$design), "(Intercept)")
+  topTable(fit = fit2, number = Inf, coef = coefName) %>%
+    filter(P.Value <= 0.05) %>%
+    mutate(modelName = modelName, coefName = coefName) %>%
+    rbind(top, .) -> top
+}
+top %>%
+  group_by(modelName, coefName) %>%
+  summarize(p = n(),
+            adj.p = sum(adj.P.Val <= 0.05))
+@
+
+<<dowload-gsea-gmt, echo=FALSE, eval=FALSE>>=
+# Download GSEA JAR file and hallmark GMT
+gseaJar <- "/Users/sxf279/Desktop/Projects/Utils/GSEA/gsea-3.0.jar"
+gmtFile <- file.path("/Users/sxf279/Desktop/Projects/20140703_VaxDB/Workspace",
+                     "input/gmt/vaxdb.gmt")
+@
+
+<<create-rnk, echo=FALSE, eval=FALSE>>=
+# create ranked list file
+rnkList <- contrastLS <- NULL
+for (modelName in names(fits2)) {
+  fit2 <- fits2[[modelName]]$fit2
+  # for each contrast of the MArrayLM create a ranked list file (RNK)
+  coefName <- setdiff(colnames(fit2$design), "(Intercept)")
+  # sort by LR signed by logFC
+  top <- topTable(fit2, coef = coefName, number = Inf) %>%
+      as.data.frame() %>%
+      # remove ambiguous mapping (gene_ids annotated to same gene_name)
+      # select the gene_id expressed in average the most in samples
+      arrange(desc(abs(t))) %>%
+      filter(!duplicated(gene_name)) %>%
+      arrange(desc(t)) %>%
+      select(gene_name, t)
+  rnkFile <- paste0("gsea_", modelName, "_", coefName,  ".rnk")
+  rnkFile <- make.names(rnkFile)
+  rnkFile <- file.path(workDir, "advanced", rnkFile)
+    write(paste(c("#", colnames(top)), collapse = " "), file = rnkFile)
+    write_tsv(top,
+              path      = rnkFile,
+              append    = TRUE,
+              col_names = FALSE)
+  rnkLS  <-  c(modelName = modelName,
+               contrast  = coefName,
+               rnk       = rnkFile)
+  rnkList <- rbind(rnkList, rnkLS)
+}
+rnkList <- as.data.frame(rnkList)
+@
+
+<<create-gsea-parameters-file, echo=FALSE, eval=FALSE>>=
+# create GSEA parameters file
+gseaParam <- file.path(workDir, "advanced/GSEAPrerankedParameters.txt")
+gseaParamMat <- as.matrix(c(collapse             = "false",
+                            nperm                = "1000",
+                            scoring_scheme       = "weighted",
+                            include_only_symbols = "true",
+                            make_sets            = "true",
+                            plot_top_x           = 0,
+                            rnd_seed             = 101,
+                            set_max              = 2000,
+                            set_min              = 15,
+                            zip_report           = "false",
+                            gui                  = "false"),
+                          ncol = 1) %>%
+  as.data.frame() %>%
+  rownames_to_column()
+write_tsv(gseaParamMat,
+          path      = gseaParam,
+          col_names = FALSE)
+@
+
+Run preranked GSEA and test Shalovain trained immunity signatures
+<<run-gsea, echo=FALSE, eval=FALSE>>=
+# result will be written in directory called advanced
+# generate GSEA command line call
+gseaJava <- "java -Xmx4G -cp"
+gseaIndex <- lapply(rnkList$rnk, FUN = function(gseaRnk) {
+  logFileName <- gsub(pattern = "rnk$", replacement = "log", gseaRnk)
+  gseaRpt <- paste(gsub(pattern     = "rnk",
+                        replacement = "",
+                        basename(gseaRnk)),
+                   gsub(pattern     = "^([^\\.]+).+$",
+                        replacement = "\\1",
+                        basename(gmtFile)),
+                     sep = ".") %>%
+    substring(first = 0, last = 50)
+  gseaCall <- paste(gseaJava,
+                    gseaJar,
+                    "xtools.gsea.GseaPreranked -param_file",
+                    gseaParam,
+                    "-rnk",
+                    gseaRnk,
+                    "-gmx",
+                    gmtFile,
+                    "-rpt_label",
+                    gseaRpt,
+                    "-out",
+                    gseaDir,
+                    ">",
+                    logFileName)
+  #gseaIntern <- system(command       = gseaCall,
+  #                     intern        = TRUE,
+  #                     ignore.stderr = TRUE)
+  return(value = c(rnk = gseaRnk, rpt = file.path(gseaDir, gseaRpt)))
+})
+gseaIndex <- do.call(what = rbind, args = gseaIndex)
+gseaIndex <- merge(rnkList, gseaIndex, by = "rnk")
+@
+
+<<clean-up-advanced-directory, echo=FALSE, eval=FALSE>>=
+# remove previous gsea run from the advanced directory
+dirLS <- list.dirs(path = file.path(workDir, "advanced"), recursive = FALSE)
+dirLS <- cbind(directory = dirLS,
+               rpt       = gsub(pattern = ".GseaPreranked.+$",
+                   replacement = "",
+                   basename(dirLS))) %>%
+  as.data.frame() %>%
+  mutate(rpt = file.path(gseaDir, rpt))
+gseaIndex <- merge(gseaIndex, dirLS, by = "rpt")
+# print gsea output directories
+select(gseaIndex, modelName, contrast) %>%
+print()
+@
+
+<<delete-temporary-directory, echo=FALSE, eval=FALSE>>=
+# delete temporary directory create during gsea run
+dirName <- tolower(format(Sys.Date(), "%b%d"))
+flag <- file.remove(dirName)
+@
+
+<<read-gsea-output, warning=FALSE, echo=FALSE, eval=FALSE>>=
+# read gsea output directories
+gseaOutput <- apply(gseaIndex, MARGIN = 1, FUN = function(gseaRun) {
+  print(gseaRun[["modelName"]])
+  gseaDir <- gseaRun[["directory"]]
+  # read rpt file in gsea output directory
+  rptFile <- list.files(path = gseaDir, pattern = "rpt", full.names = TRUE)
+  rpt <- read_tsv(file      = rptFile,
+                  col_names = c("type", "name", "value"))
+  # read gmt file
+  gmxFile <- gmtFile # rpt$value[rpt$name %in% "gmx"]
+  cNames <- count_fields(file = gmxFile, tokenizer = tokenizer_tsv()) %>%
+    max() %>%
+    seq(from = 1) %>%
+    as.character()
+  gmx <- read_tsv(file = gmxFile, col_names = cNames)
+  # remove geneset name and description column
+  gsNames <- toupper(gmx$"1")
+  gmx <- apply(select(gmx, -(1:2)), MARGIN = 1, FUN = function(x) {
+    return(value = setdiff(unname(x), NA))
+  })
+  names(gmx) <- gsNames
+  # read result files
+  resFile <- grep(pattern = "gsea_report.*xls",
+                  dir(path = gseaDir, full.names = TRUE),
+                  value   = TRUE)
+  resOut <- lapply(resFile, FUN = function(fileName) {
+    resTable <- read_tsv(file = fileName)
+  })
+  resOut <- do.call(what = rbind, args = resOut)
+  # extract leading edge genes
+  rnk <- read_tsv(file      = gseaRun[["rnk"]],
+                  skip      = 1,
+                  col_names = c("SYMBOL", "score")) %>%
+         arrange(desc(score))
+  leGenes <- group_by(resOut, NAME) %>%
+             do(LEADING_EDGE = ifelse(test = sign(.$NES) %in% 1,
+                    yes = paste(intersect(rnk$SYMBOL[seq(from = 1,
+                        to = .$"RANK AT MAX" + 1)],
+                        gmx[[.$NAME]]), collapse = ","),
+                    no  = paste(intersect(rnk$SYMBOL[seq(from = nrow(rnk) -
+                        .$"RANK AT MAX",
+                        to = nrow(rnk))],
+                        gmx[[.$NAME]]), collapse = ","))) %>%
+             ungroup() %>%
+             mutate(LEADING_EDGE = unlist(LEADING_EDGE))
+  resOut <- merge(resOut, leGenes, by = "NAME")
+  # append directory name
+  resOut <- mutate(resOut, directory = gseaDir)
+  return(value = resOut)
+})
+gseaOutput <- do.call(what = rbind, args = gseaOutput)
+gseaOutput <- merge(gseaOutput, gseaIndex, by = "directory")
+save(gseaOutput,
+     file = file.path(workDir, "data/vb012.gseaOutput.mono_fcm.vaxdb.RData"))
+@
+
+<<load-gseaoutput, echo=FALSE>>=
+load(file = file.path(workDir, "data/vb012.gseaOutput.mono_fcm.vaxdb.RData"))
+gseaFCM <- gseaOutput
+@ 
+
+<<print-shalovain, echo=FALSE>>=
+cat("check trained monocytes signatures:")
+gsName <- c(paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                   "RECOVERYMONOCYTE_LPS_VS_NONE_UP"),
+            paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                   "RECOVERYMONOCYTELPS_VS_SEPSISMONOCYTELPS_UP"))
+filter(gseaFCM, NAME %in% gsName) %>%
+  select(modelName, NAME, NES, `NOM p-val`, `FDR q-val`)
+#cat("\n\nprint all signatures associated with FCM frequencies:")
+#filter(gseaFCM, grepl(pattern = "SHALOVAIN", NAME) &
+#                     `FDR q-val` <= 0.25) %>%
+#  select(modelName, NAME, NES, `NOM p-val`, `FDR q-val`)
+@
+The trained immunity signature is associated negatively with nonclassical monocytes.
+\hfill\break
+\hfill\break
+Plot trained immunity signature and non-classical mono in ALV group post4th
+<<overlap-with-challenge, echo=FALSE>>=
+load(file = file.path(workDir, "data/guroff.gseaOutput.vaxdb.RData"))
+gseaChallenge <- gseaOutput
+
+gsName <- paste0("SHALOVAIN_2015_IMMUNITY_SHALOVAIN_2015_IMMUNITY.",
+                 "RECOVERYMONOCYTE_LPS_VS_NONE_UP")
+challengeLS <- gseaChallenge %>%
+  filter(NAME %in% gsName &
+           `NOM p-val` <= 0.05 &
+           modelName %in% "ALVAC.post4th-pre_challenge") %>%
+  .$LEADING_EDGE %>%
+  strsplit(split = ",") %>%
+  unlist()
+fcmLS <- filter(gseaFCM, NAME %in% gsName &
+                              `NOM p-val` <= 0.05) %>%
+  .$LEADING_EDGE %>%
+  strsplit(split = ",") %>%
+  unlist()
+commonLS <- intersect(challengeLS, fcmLS)
+@
+
+<<scatter-non-classical, echo=FALSE, fig.width=6, fig.height=4.5>>=
+id2var <- apply(normCounts(esetCombatBaselined),
+                MARGIN = 1,
+                FUN = var) %>%
+  data.frame(sigma2 = .) %>%
+  rownames_to_column() %>%
+  merge(y = fData(esetCombatBaselined), by.x = "rowname", by.y = "gene_id") %>%
+  arrange(desc(sigma2)) %>%
+  filter(!is.na(gene_name) & !duplicated(gene_name))
+mat <- normCounts(esetCombatBaselined)[id2var$rowname, ]
+rownames(mat) <- id2var$gene_name
+# mat <- t(scale(t(mat)))
+B <- 1000
+gs <- intersect(commonLS, rownames(mat))
+ngenes <- length(gs)
+mu <- colMeans(mat[gs, ])
+muPermut <- mclapply(1:B, FUN = function(seed) {
+  set.seed(seed = seed)
+  muHat <- colMeans(mat[sample.int(nrow(mat), ngenes), ],
+                    na.rm = TRUE)
+  return(value = muHat)
+})
+muPermut <- do.call(what = rbind, args = muPermut)
+zscore <- (mu - colMeans(muPermut)) / apply(muPermut, MARGIN = 2, FUN = sd)
+sleaDF <- data.frame(slea = zscore)
+
+plotDF <- sleaDF %>%
+  rownames_to_column() %>%
+  merge(y = select(pData(esetCombatBaselined),
+                   `Sample Identification.CWRU ID`,
+                   Macaque,
+                   Group,
+                   `Sample Identification.Time Point`,
+                   `No. of.challenges`),
+        by.x = "rowname", by.y = "Sample Identification.CWRU ID") %>%
+  filter(Group %in% "ALVAC group" &
+           `Sample Identification.Time Point` %in% "wk36 + 1d") %>%
+  merge(y = select(fcmDF,
+                   AnimalID,
+                   `Subtraced.Non Classical`),
+        by.x = "Macaque",
+        by.y = "AnimalID") %>%
+  mutate(`No. of.challenges` = gsub(pattern = ">15",
+                                    replacement = 16,
+                                    `No. of.challenges`),
+         `No. of.challenges` = as.numeric(`No. of.challenges`),
+         `Subtraced.Non Classical` = as.numeric(`Subtraced.Non Classical`))
+
+cor.test(formula = ~`Subtraced.Non Classical`+slea,
+         data = plotDF,
+         method = "spearman")
+
+ggplot(data = plotDF,
+       mapping = aes(x = slea, y = `Subtraced.Non Classical`)) +
+  geom_point(mapping = aes(size = `No. of.challenges`,
+			   color = `No. of.challenges`)) +
+  labs(x = paste("SHALOVAIN_2015_IMMUNITY.RECOVERYMONOCYTE_LPS_VS_NONE_UP",
+                 "(SLEA z-score)"),
+       y = "Non classical monocytes (wk26-pre)") +
+  geom_smooth(method = "lm", color = "black") +
+  scale_color_gradient2(low = "yellow", mid = "orange", high = "red") +
+  theme_bw() +
+  theme(axis.title.x = element_text(size = 5))
+@
+
+<<session-info, echo=FALSE, eval=FALSE>>=
+# print session info
+sessionInfo()
+@
+\end{document}
